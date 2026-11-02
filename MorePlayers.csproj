@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <AssemblyName>ADVR.MorePlayers</AssemblyName>
+    <LangVersion>latest</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>disable</Nullable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <Version>1.1.0</Version>
+    <!-- Override on the command line if the game lives elsewhere -->
+    <GameDir Condition="'$(GameDir)' == ''">$(HOME)/.local/share/Steam/steamapps/common/Ancient Dungeon VR</GameDir>
+    <Managed>$(GameDir)/Ancient_Dungeon_Data/Managed</Managed>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="testbridge/**" />
+    <None Remove="testbridge/**" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <PackageReference Include="BepInEx.AssemblyPublicizer.MSBuild" Version="0.4.3" PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="lib/BepInEx.dll" Private="false" />
+    <Reference Include="lib/0Harmony.dll" Private="false" />
+    <Reference Include="$(Managed)/ADVR.dll" Private="false" Publicize="true" />
+    <Reference Include="$(Managed)/Fusion.Runtime.dll" Private="false" />
+    <Reference Include="$(Managed)/Fusion.Common.dll" Private="false" />
+    <Reference Include="$(Managed)/Fusion.Realtime.dll" Private="false" />
+    <Reference Include="$(Managed)/UnityEngine.dll" Private="false" />
+    <Reference Include="$(Managed)/UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="$(Managed)/UnityEngine.UI.dll" Private="false" />
+    <Reference Include="$(Managed)/UnityEngine.PhysicsModule.dll" Private="false" />
+    <Reference Include="$(Managed)/UnityEngine.UIModule.dll" Private="false" />
+    <Reference Include="$(Managed)/Unity.TextMeshPro.dll" Private="false" />
+  </ItemGroup>
+</Project>
