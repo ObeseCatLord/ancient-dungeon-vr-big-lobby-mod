@@ -126,3 +126,7 @@ first. The output is `bin/Release/net472/ADVR.MorePlayers.dll`. It references th
 - The game has its own `allowMods` lobby flag for its built-in (Lua) mod loader. This plugin doesn't touch it.
 - Built with AI assistance (Claude), using decompiled game code for reference only. No game code is
   redistributed.
+
+## License
+
+GNU General Public License v3.0. See [LICENSE](LICENSE).
