@@ -5,8 +5,9 @@ A BepInEx 5 plugin that raises the multiplayer lobby cap from 4 to 8.
 ## What it does
 
 **Lobby**
-- In the multiplayer menu, the **4** button now cycles 4 → 5 → 6 → 7 → 8. Its label shows the current
-  size. The 2 and 3 buttons work as before, and new lobbies default to 8 (configurable).
+- In the multiplayer menu, the **4** button becomes a 4–8 size button and new lobbies default to 8
+  (configurable). While it's selected, each press steps 4 → 5 → 6 → 7 → 8 → 4 and the label shows the
+  current size. While 2 or 3 is selected, the label shows the maximum and one press jumps straight to it.
 - The public room browser lists rooms up to 8 players and shows real counts (e.g. 6/8).
 - The connected-players list gets rows 5–8, with working kick buttons for the host. The list shrinks
   to fit its panel.
@@ -14,21 +15,24 @@ A BepInEx 5 plugin that raises the multiplayer lobby cap from 4 to 8.
 **Run start**
 - The game's ready list has 4 fixed networked slots. The host tracks players 5–8 itself and waits for
   them to be ready before allowing Start.
-- Weapon-pick name badges show players 5–8. The host shares their picks through one extra session
-  property, which the mod adds when it creates the room. Each weapon button holds up to 8 names and
+- Weapon-pick name badges show players 5–8. The host sends their picks to the other players as a
+  mod-only network message, which unmodded players ignore. Each weapon button holds up to 8 names and
   shrinks the name column when more than 4 are showing.
 
 **Gameplay fixes for players 5–8**
-- Start floor: players 5–8 share the 4 entrance spawn spots. Vanilla throws here and aborts dungeon
-  generation for those players.
+- Start floor: players 5–8 share the 4 entrance spawn spots, offset 0.6 m to the side so nobody spawns
+  inside another player. Vanilla throws here and aborts dungeon generation for those players.
 - Inventory/stat screen: per-player pickup panels and name/mute/teleport rows are added for players
   5–8. Vanilla throws while wiring up the inventory, which breaks weapons and relics. The other-player
   stats panel no longer throws, which used to freeze the inventory half-open.
 - Scrying-glass drops (weapon parts, augment crystals) with more than 4 owners now spawn. Vanilla left an
-  empty pedestal.
+  empty pedestal. The glass's speech bubble still only shows for 4 of the owners (4 networked slots).
+- Special enemies that agree on a position across players (King Slime, phase-jumping and teleporting
+  enemies) now weigh every player's view, not just the first 4.
 - "One for every player" pedestals offer one option per player, up to 8. Vanilla stopped at 4.
   - Options 5–8 come from the same drop table, continuing the game's seeding.
-  - Taking any option greys out all the others, as in vanilla.
+  - The host tells the other players which items are options 5–8. After you take one option, all the
+    others grey out for you, as in vanilla (each player's lockout is their own).
   - With 5+ items, options are laid out evenly on a ring.
 - Boss stash food (insight): the game already spawns one potato per injured player. Food 5–8 used to
   pile up on the centre spot; it's now spread on a ring.
@@ -50,12 +54,13 @@ growing past 4. The parts that stopped at 4, or broke, are extended along the ga
 | Boss HP (most bosses) | per-boss table for 1–4 | table extended linearly (vanilla threw → unscaled HP, no NG+) |
 | Final boss | arms and stage 2 HP × players, stage 3 × (1 + 0.55 per extra player) | unchanged, but HP now saturates at 32767 instead of overflowing to negative |
 | Crystal boss spikes / adds | table for 1–4 | table extended linearly (vanilla soft-locked) |
-| Deranged adventurer, book boss, challenge chests | +HP / +spawns per player | unchanged (already linear) |
+| Deranged adventurer, challenge chests | +HP / +spawns per player | unchanged (already linear) |
+| Book boss | +0.6 chance per extra player for extra wave enemies, capped at +2 each | unchanged (saturates around 4–5 players) |
 | Arena: extra enemies per wave | 0.25 × players × wave size | continues: 2× wave size at 8 |
 | Arena: extra concurrent enemies | 0, 1, 1, 2 | +1 per 2 more players (4 at 8) |
 | Arena: spawn interval | ×1, ×0.725, ×0.6, ×0.5 | ×2/players (×0.25 at 8) |
 | Arena: relic loot | 2/1, 3/2, 4/2, 4/2 (count/picks) | stays 4/2 (one pedestal per item) |
-| Arcane rift: max alive enemies | players + 1 | players + 1 (vanilla dropped to 2) |
+| Arcane rift: max alive enemies | players + 1 | players + 1, up to 9 (vanilla dropped to 2) |
 | Loot table mix | blends toward the multiplayer weights, fully at 4 | unchanged (stays at the 4-player mix) |
 | Dungeon size | solo vs co-op layout only, not by count | unchanged (see below) |
 
@@ -78,7 +83,7 @@ list.
 |---|---|---|
 | Room size, ready gate, boss/arena/rift scaling, scrying glass, pedestal options 5–8, food layout, kick rows | host | get the result (it's all host-spawned or host-decided) |
 | Weapon badges for players 5–8 | host + viewer | see the vanilla 4 badges |
-| Pedestal "take one" lockout for options 5–8 | each player | only options 1–4 grey out for them, so they could take an extra |
+| Pedestal "take one" lockout for options 5–8 | host + each player | only options 1–4 grey out for them, so they could take an extra |
 | Inventory, stat screen, start-floor spawn, public list, player list rows, insight locks, minimap | each player | vanilla behaviour; with 5+ players their inventory and first-floor spawn can break |
 
 ## Known limitations
@@ -86,15 +91,24 @@ list.
 - **Host migration** isn't supported for 5+ player sessions. If the host leaves mid-session, the new
   host only tracks 4 players for the ready gate.
 - **Other players' stat panels** in the inventory only show as many players as the scene has panels.
+- **"Bought by all players" insight upgrades** (e.g. the boss stash) only take effect once every player
+  has bought them, as in vanilla. That's rarer with 8 players.
+- **Arena relic waves** stay at 4 items / 2 picks, the 4-player amount.
+- **Small VR targets:** with 8 players, the lobby list rows and insight locks are scaled down to fit their
+  panels.
+- **Game updates:** each patch is applied separately and checks that the game code still looks as
+  expected. If one of the fixes that keep 5+ player sessions working can't be applied, the mod logs an
+  error and keeps lobbies at 4 players instead of creating rooms that would break.
 - **What's been tested** (off-screen, non-VR mode, one machine):
   - every patch applies;
   - an 8-slot private room was created on Photon;
-  - the host published picks for players 5–8 to the room and read them back;
+  - (1.2) every patch still applies, each at its expected number of sites;
   - the lobby picker, the 8-row player list, 8 insight locks and 8 weapon badges work;
   - the pedestal/food ring layout and scaling formulas give the expected values.
 
   A real 5–8 player session hasn't been played yet, so pedestal options 5–8 haven't been seen in a
-  dungeon. Please report issues.
+  dungeon, and the mod-to-mod messages added in 1.2 (weapon badges and pedestal options for players
+  5–8) haven't been tested between two machines. Please report issues.
 
 ## Install
 

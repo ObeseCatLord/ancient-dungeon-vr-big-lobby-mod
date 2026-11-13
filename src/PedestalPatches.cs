@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using Fusion;
 using HarmonyLib;
@@ -27,18 +28,53 @@ internal static class RingLayoutPatch
 }
 
 /// "Choose one for every player" pedestals hold their options in 4 networked fields, so vanilla never
-/// offers more than 4. The host spawns options 5-8 as ordinary networked items. Every client (and the
-/// host) tracks them so taking any option greys out the rest, as vanilla does for the first 4.
+/// offers more than 4. The host spawns options 5-8 as ordinary networked items and tells the other
+/// players their network ids over ModNet. Each player then tracks them like the first 4: taking any
+/// option greys out the rest for that player (the lockout is per player, as in vanilla).
 /// Unmodded clients see the extra options too, but only the first 4 grey out for them.
 [HarmonyPatch(typeof(PodestChooseOneForEveryPlayer))]
 internal static class PedestalExtrasPatch
 {
+    // Announcements that arrived before the pedestal itself spawned locally, by pedestal id.
+    internal static readonly Dictionary<uint, uint[]> Pending = new();
+
+    internal static void RegisterNet()
+    {
+        ModNet.On(ModNet.Msg.PedestalExtras, (_, r) =>
+        {
+            uint pedestalId = r.ReadUInt32();
+            int n = r.ReadInt32();
+            var ids = new uint[n];
+            for (int i = 0; i < n; i++) ids[i] = r.ReadUInt32();
+
+            var runner = ModNet.Runner;
+            if (runner != null && runner.TryFindObject(new NetworkId { Raw = pedestalId }, out var obj) && obj != null
+                && obj.TryGetComponent<PedestalExtras>(out var tracker))
+                tracker.Expect(ids);
+            else
+                Pending[pedestalId] = ids;
+        });
+    }
+
     [HarmonyPostfix, HarmonyPatch(nameof(PodestChooseOneForEveryPlayer.Spawned))]
     private static void Spawned_Postfix(PodestChooseOneForEveryPlayer __instance)
     {
-        var tracker = __instance.gameObject.GetComponent<PedestalExtras>() ?? __instance.gameObject.AddComponent<PedestalExtras>();
-        tracker.Init(__instance);
-        if (__instance.HasStateAuthority) SpawnExtras(__instance, tracker);
+        try
+        {
+            var tracker = __instance.gameObject.GetComponent<PedestalExtras>() ?? __instance.gameObject.AddComponent<PedestalExtras>();
+            tracker.Init(__instance);
+            if (__instance.HasStateAuthority)
+            {
+                SpawnExtras(__instance, tracker);
+                tracker.Announce(null);
+            }
+            else if (__instance.Object != null && Pending.TryGetValue(__instance.Object.Id.Raw, out var ids))
+            {
+                Pending.Remove(__instance.Object.Id.Raw);
+                tracker.Expect(ids);
+            }
+        }
+        catch (Exception e) { Plugin.Log.LogError($"Pedestal extras failed: {e}"); }
     }
 
     [HarmonyPostfix, HarmonyPatch(nameof(PodestChooseOneForEveryPlayer.MakeAllUnobtainable))]
@@ -78,17 +114,58 @@ internal static class PedestalExtrasPatch
 
 internal class PedestalExtras : MonoBehaviour
 {
-    private const float DiscoverySeconds = 20f;
+    private const float ResolveTimeout = 60f;
 
     private PodestChooseOneForEveryPlayer _owner;
     private readonly List<NetworkObject> _extras = new();
-    private float _discoverUntil, _nextScan;
-    private bool _unobtainable;
+    private readonly List<uint> _unresolved = new();
+    private float _resolveUntil, _nextTry;
+    private bool _unobtainable, _subscribed;
 
     public void Init(PodestChooseOneForEveryPlayer owner)
     {
         _owner = owner;
-        _discoverUntil = Time.time + DiscoverySeconds;
+        enabled = false;
+        if (owner.HasStateAuthority && !_subscribed)
+        {
+            GameHandler.INSTANCE.AfterPlayerJoined += OnPlayerJoined;
+            _subscribed = true;
+        }
+    }
+
+    private void OnDestroy()
+    {
+        if (_subscribed && GameHandler.INSTANCE != null) GameHandler.INSTANCE.AfterPlayerJoined -= OnPlayerJoined;
+    }
+
+    private void OnPlayerJoined(PlayerRef player) => Announce(player);
+
+    /// Host: tell everyone (target == null) or one late joiner which items are this pedestal's extras.
+    public void Announce(PlayerRef? target)
+    {
+        if (_owner == null || _owner.Object == null || _extras.Count == 0) return;
+        uint pedestalId = _owner.Object.Id.Raw;
+        var ids = new List<uint>();
+        foreach (var no in _extras) if (no != null && no.IsValid) ids.Add(no.Id.Raw);
+        if (ids.Count == 0) return;
+        Action<System.IO.BinaryWriter> write = w =>
+        {
+            w.Write(pedestalId);
+            w.Write(ids.Count);
+            foreach (var id in ids) w.Write(id);
+        };
+        if (target.HasValue) ModNet.SendTo(target.Value, ModNet.Msg.PedestalExtras, write);
+        else ModNet.Broadcast(ModNet.Msg.PedestalExtras, write);
+    }
+
+    /// Client: the host told us these are the extras; resolve them as they spawn locally.
+    public void Expect(uint[] ids)
+    {
+        _unresolved.Clear();
+        _unresolved.AddRange(ids);
+        _resolveUntil = Time.unscaledTime + ResolveTimeout;
+        enabled = true;
+        TryResolve();
     }
 
     public void Track(NetworkObject no)
@@ -114,23 +191,27 @@ internal class PedestalExtras : MonoBehaviour
         no.GetComponentInChildren<ItemCreator>()?.SetTransparent(transparent: true, 0.5f);
     }
 
-    // Clients only see the extra options as networked items near the pedestal; find them there.
+    private void TryResolve()
+    {
+        var runner = ModNet.Runner;
+        if (runner == null) return;
+        for (int i = _unresolved.Count - 1; i >= 0; i--)
+        {
+            if (runner.TryFindObject(new NetworkId { Raw = _unresolved[i] }, out var no) && no != null)
+            {
+                Track(no);
+                _unresolved.RemoveAt(i);
+            }
+        }
+        if (_unresolved.Count == 0) enabled = false;
+    }
+
+    // Only enabled while some announced extras haven't spawned locally yet.
     private void Update()
     {
-        if (_owner == null || _owner.Object == null || _owner.HasStateAuthority) return;
-        if (Time.time > _discoverUntil || Time.time < _nextScan) return;
-        _nextScan = Time.time + 0.5f;
-
-        int expected = GameHandler.INSTANCE.GetAllPlayers().Count - Plugin.VanillaMax;
-        if (expected <= 0 || _extras.Count >= expected) return;
-
-        var center = _owner.transform.position + Vector3.up * 1.1f;
-        foreach (var col in Physics.OverlapSphere(center, 0.8f, ~0, QueryTriggerInteraction.Collide))
-        {
-            var no = col.GetComponentInParent<NetworkObject>();
-            if (no == null || _extras.Contains(no) || no.GetComponent<ItemUpgrade>() == null) continue;
-            if (no == _owner.Object1 || no == _owner.Object2 || no == _owner.Object3 || no == _owner.Object4) continue;
-            Track(no);
-        }
+        if (Time.unscaledTime > _resolveUntil) { enabled = false; return; }
+        if (Time.unscaledTime < _nextTry) return;
+        _nextTry = Time.unscaledTime + 0.25f;
+        TryResolve();
     }
 }

@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Fusion;
@@ -12,8 +13,8 @@ namespace ADVRMorePlayers;
 /// in a local overflow table:
 /// - it gates the Start button on them too;
 /// - it promotes them into the real list when a slot frees up;
-/// - it publishes their weapon picks in a session (Photon room) property, so modded clients can show
-///   their badges. Unmodded clients just show the 4 vanilla badges.
+/// - it sends their weapon picks to the other players over ModNet, so modded clients can show their
+///   badges. Unmodded clients just show the 4 vanilla badges.
 [HarmonyPatch(typeof(UIPrepareBase))]
 internal static class PreparationPatches
 {
@@ -25,21 +26,33 @@ internal static class PreparationPatches
 
     private const string DefaultWeapon = "swordknife";
 
-    /// Session property carrying overflow weapon picks for every prep panel:
-    /// "panelId=player:weapon,player:weapon/panelId=...". Fusion only lets the host update keys that
-    /// existed when the room was created, so RegisterSessionKeyPatch adds it at creation time.
-    internal const string SessionKey = "mpPrep";
-
+    // Host: overflow players per panel, and what was last sent for each panel.
     private static readonly Dictionary<UIPrepareBase, Dictionary<PlayerRef, Entry>> Overflow = new();
-    private static string _lastPublished = "";
+    private static readonly Dictionary<UIPrepareBase, string> LastSent = new();
+
+    // Clients: overflow picks received from the host, by panel network id.
+    private static readonly Dictionary<uint, List<(PlayerRef player, string weapon)>> Received = new();
+
+    internal static void RegisterNet()
+    {
+        ModNet.On(ModNet.Msg.PrepPicks, (_, r) =>
+        {
+            uint panelId = r.ReadUInt32();
+            int n = r.ReadInt32();
+            var picks = new List<(PlayerRef, string)>(n);
+            for (int i = 0; i < n; i++) picks.Add((PlayerRef.FromEncoded(r.ReadInt32()), r.ReadString()));
+            Received[panelId] = picks;
+            foreach (var panel in UnityEngine.Object.FindObjectsByType<UIPrepareBase>(FindObjectsSortMode.None))
+                if (panel.Object != null && panel.Object.IsValid && panel.Object.Id.Raw == panelId)
+                    panel.GetComponent<PrepWatcher>()?.Redraw();
+        });
+    }
 
     private static Dictionary<PlayerRef, Entry> OverflowOf(UIPrepareBase p)
     {
         if (!Overflow.TryGetValue(p, out var d)) Overflow[p] = d = new Dictionary<PlayerRef, Entry>();
         return d;
     }
-
-    internal static string PanelId(UIPrepareBase p) => p.Object.Id.Raw.ToString();
 
     private static bool InList(UIPrepareBase p, PlayerRef player)
     {
@@ -51,7 +64,8 @@ internal static class PreparationPatches
     /// Add to the networked list if there is room, otherwise to the host-side overflow table.
     private static void SafeAdd(UIPrepareBase p, PlayerRef player)
     {
-        if (InList(p, player)) return;
+        var of = OverflowOf(p);
+        if (InList(p, player) || of.ContainsKey(player)) return;
         bool ready = p.networkObject.StateAuthority == player;
         var list = p.NetworkedPreparationList;
         if (list.Count < list.Capacity)
@@ -59,29 +73,31 @@ internal static class PreparationPatches
             list.Add(new UIPrepareBase.NetworkPreparationInfo { playerRef = player, weaponId = DefaultWeapon, ready = ready });
             return;
         }
-        var of = OverflowOf(p);
-        if (!of.ContainsKey(player)) of[player] = new Entry { Ready = ready };
-        Plugin.Log.LogInfo($"Run preparation list full; tracking {player} host-side");
+        of[player] = new Entry { Ready = ready };
+        Plugin.Log.LogDebug($"Run preparation list full; tracking {player} host-side");
         Publish(p);
     }
 
-    /// Host: write overflow players' weapon picks to the session so modded clients can draw them.
-    private static void Publish(UIPrepareBase p)
+    /// Host: send overflow players' weapon picks to the other players if they changed.
+    /// `force` resends unchanged data (e.g. to a player who just joined).
+    private static void Publish(UIPrepareBase p, bool force = false)
     {
-        if (!p.HasStateAuthority) return;
-        var runner = p.Runner;
-        if (runner == null || runner.IsSinglePlayer || runner.SessionInfo == null) return;
-        string value = string.Join("/", Overflow
-            .Where(kv => kv.Key != null && kv.Key.Object != null && kv.Value.Count > 0)
-            .Select(kv => PanelId(kv.Key) + "=" + string.Join(",", kv.Value.Select(e => $"{e.Key.RawEncoded}:{e.Value.Weapon}"))));
-        if (value == _lastPublished) return;
-        if (runner.SessionInfo.UpdateCustomProperties(new Dictionary<string, SessionProperty> { { SessionKey, value } }))
-            _lastPublished = value;
-        else
-            Plugin.Log.LogWarning("Couldn't publish weapon picks for players 5+ (room created without the mod, or too much data)");
+        if (!p.HasStateAuthority || p.Object == null || !p.Object.IsValid) return;
+        Overflow.TryGetValue(p, out var of);
+        var picks = of?.Select(kv => (kv.Key, kv.Value.Weapon)).ToList() ?? new List<(PlayerRef, string)>();
+        string signature = string.Join(";", picks.Select(x => $"{x.Item1.RawEncoded}:{x.Item2}"));
+        if (!force && LastSent.TryGetValue(p, out var last) && last == signature) return;
+        LastSent[p] = signature;
+        uint panelId = p.Object.Id.Raw;
+        ModNet.Broadcast(ModNet.Msg.PrepPicks, w =>
+        {
+            w.Write(panelId);
+            w.Write(picks.Count);
+            foreach (var (player, weapon) in picks) { w.Write(player.RawEncoded); w.Write(weapon ?? DefaultWeapon); }
+        });
     }
 
-    /// Overflow players' weapon picks: the host reads its table, clients read the session property.
+    /// Overflow players' weapon picks: the host reads its table, clients read what the host sent.
     internal static IEnumerable<(PlayerRef player, string weapon)> OverflowPicks(UIPrepareBase p)
     {
         if (p.HasStateAuthority)
@@ -90,34 +106,35 @@ internal static class PreparationPatches
                 foreach (var kv in of) yield return (kv.Key, kv.Value.Weapon);
             yield break;
         }
-        string panel = PanelId(p) + "=";
-        string mine = PrepWatcher.Read().Split('/').FirstOrDefault(x => x.StartsWith(panel));
-        if (mine == null) yield break;
-        foreach (var part in mine.Substring(panel.Length).Split(','))
-        {
-            int colon = part.IndexOf(':');
-            if (colon <= 0 || !int.TryParse(part.Substring(0, colon), out int raw)) continue;
-            yield return (PlayerRef.FromEncoded(raw), part.Substring(colon + 1));
-        }
+        if (p.Object != null && Received.TryGetValue(p.Object.Id.Raw, out var picks))
+            foreach (var pick in picks) yield return pick;
     }
 
     [HarmonyPrefix, HarmonyPatch(nameof(UIPrepareBase.Spawned))]
-    private static void Spawned_Prefix(UIPrepareBase __instance) => Overflow.Remove(__instance);
+    private static void Spawned_Prefix(UIPrepareBase __instance)
+    {
+        Overflow.Remove(__instance);
+        LastSent.Remove(__instance);
+    }
 
     // The vanilla Spawned() lambda adds every player and throws "NetworkList is full" at the 5th.
     // That lambda is disabled below; add the players ourselves.
     [HarmonyPostfix, HarmonyPatch(nameof(UIPrepareBase.Spawned))]
     private static void Spawned_Postfix(UIPrepareBase __instance)
     {
-        var gi = GameHandler.INSTANCE;
-        if (!gi.IsSinglePlayer() && __instance.GetComponent<PrepWatcher>() == null)
-            __instance.gameObject.AddComponent<PrepWatcher>().owner = __instance;
-        if (gi.GetAllPlayers().Count == 0 || !__instance.HasStateAuthority) return;
-        __instance.RunWhenValid(() =>
+        try
         {
-            foreach (var p in gi.GetAllPlayers()) SafeAdd(__instance, p.spawnedPlayerId);
-            __instance.OnNetworkedPreparationChanged();
-        });
+            var gi = GameHandler.INSTANCE;
+            if (!gi.IsSinglePlayer() && __instance.GetComponent<PrepWatcher>() == null)
+                __instance.gameObject.AddComponent<PrepWatcher>().owner = __instance;
+            if (gi.GetAllPlayers().Count == 0 || !__instance.HasStateAuthority) return;
+            __instance.RunWhenValid(() =>
+            {
+                foreach (var p in gi.GetAllPlayers()) SafeAdd(__instance, p.spawnedPlayerId);
+                __instance.OnNetworkedPreparationChanged();
+            });
+        }
+        catch (Exception e) { Plugin.Log.LogError($"Run preparation setup failed: {e}"); }
     }
 
     [HarmonyPatch]
@@ -137,6 +154,8 @@ internal static class PreparationPatches
         {
             if (!__instance.HasStateAuthority) return;
             SafeAdd(__instance, pPlayerRef);
+            // Late joiner: give them the current overflow picks too.
+            Publish(__instance, force: true);
             __instance.OnNetworkedPreparationChanged();
         });
         return false;
@@ -165,26 +184,34 @@ internal static class PreparationPatches
     [HarmonyPostfix, HarmonyPatch(nameof(UIPrepareBase.OnNetworkedPreparationChanged))]
     private static void OnNetworkedPreparationChanged_Postfix(UIPrepareBase __instance)
     {
-        var gi = GameHandler.INSTANCE;
-        if (gi.IsSinglePlayer()) return;
-
-        var picks = OverflowPicks(__instance).ToList();
-        if (picks.Count > 0)
+        try
         {
-            foreach (var button in __instance.weaponSelectionGroup.GetComponentsInChildren<RunPreparationUI_ButtonSelectWeapon>())
-                foreach (var (player, weapon) in picks)
-                {
-                    var info = button.weaponCombo != null && button.weaponCombo.id == weapon ? gi.GetPlayerById(player) : null;
-                    if (info != null) button.AddPlayerThatSelected(info);
-                }
-        }
+            var gi = GameHandler.INSTANCE;
+            if (gi.IsSinglePlayer()) return;
 
-        if (!__instance.HasStateAuthority || !__instance._allPlayersReady) return;
-        if (gi.debugSettings.PlayerAlwaysReadyInRunPreparation) return;
-        if (!Overflow.TryGetValue(__instance, out var of) || of.Values.All(e => e.Ready)) return;
-        __instance._allPlayersReady = false;
-        __instance.UpdateStartRunButtons(interactable: false, "multiplayer_wait_for_players_to_get_ready");
-        __instance.UpdateContinueSavedRunButtons();
+            var picks = OverflowPicks(__instance).ToList();
+            int drawn = 0;
+            if (picks.Count > 0)
+            {
+                foreach (var button in __instance.weaponSelectionGroup.GetComponentsInChildren<RunPreparationUI_ButtonSelectWeapon>())
+                    foreach (var (player, weapon) in picks)
+                    {
+                        var info = button.weaponCombo != null && button.weaponCombo.id == weapon ? gi.GetPlayerById(player) : null;
+                        if (info == null) continue;
+                        button.AddPlayerThatSelected(info);
+                        drawn++;
+                    }
+            }
+            __instance.GetComponent<PrepWatcher>()?.NoteDrawn(drawn, picks.Count);
+
+            if (!__instance.HasStateAuthority || !__instance._allPlayersReady) return;
+            if (gi.debugSettings.PlayerAlwaysReadyInRunPreparation) return;
+            if (!Overflow.TryGetValue(__instance, out var of) || of.Values.All(e => e.Ready)) return;
+            __instance._allPlayersReady = false;
+            __instance.UpdateStartRunButtons(interactable: false, "multiplayer_wait_for_players_to_get_ready");
+            __instance.UpdateContinueSavedRunButtons();
+        }
+        catch (Exception e) { Plugin.Log.LogError($"Run preparation update failed: {e}"); }
     }
 
     // Someone left: drop departed overflow players, promote waiting ones into freed slots.
@@ -209,47 +236,31 @@ internal static class PreparationPatches
     [HarmonyPrefix, HarmonyPatch(nameof(UIPrepareBase.Despawned))]
     private static void Despawned_Prefix(UIPrepareBase __instance)
     {
-        if (!Overflow.Remove(__instance)) return;
-        try { Publish(__instance); }
-        catch (System.Exception e) { Plugin.Log.LogDebug($"Clearing published picks on despawn failed: {e.Message}"); }
+        Overflow.Remove(__instance);
+        LastSent.Remove(__instance);
+        if (__instance.Object != null) Received.Remove(__instance.Object.Id.Raw);
     }
 }
 
-/// Add the side-channel key when the game creates or joins a room. Joining an existing room keeps that
-/// room's properties, so this only matters when the modded player creates it.
-[HarmonyPatch(typeof(NetworkRunner), nameof(NetworkRunner.StartGame))]
-internal static class RegisterSessionKeyPatch
-{
-    private static void Prefix(StartGameArgs args)
-    {
-        var props = args.SessionProperties;
-        if (props != null && props.ContainsKey("allowMods") && !props.ContainsKey(PreparationPatches.SessionKey))
-            props[PreparationPatches.SessionKey] = "";
-    }
-}
-
-/// Clients: redraw the weapon badges when the host's published overflow picks change.
+/// Clients: if some overflow badges couldn't be drawn yet (their player hadn't spawned locally),
+/// retry until they can. Cheap: only polls while something is missing.
 internal class PrepWatcher : MonoBehaviour
 {
     public UIPrepareBase owner;
-    private string _last = "";
+    private bool _incomplete;
     private float _next;
 
-    internal static string Read()
+    public void NoteDrawn(int drawn, int wanted) => _incomplete = drawn < wanted;
+
+    public void Redraw()
     {
-        var props = GameHandler.INSTANCE?.networkHandler?.GetNetworkRunner()?.SessionInfo?.Properties;
-        return props != null && props.TryGetValue(PreparationPatches.SessionKey, out var v) && v != null && v.IsString
-            ? (string)v : "";
+        if (owner != null && owner.Object != null && owner.Object.IsValid) owner.OnNetworkedPreparationChanged();
     }
 
     private void Update()
     {
-        if (owner == null || owner.Object == null || !owner.Object.IsValid || owner.HasStateAuthority) return;
-        if (Time.time < _next) return;
-        _next = Time.time + 0.5f;
-        string now = Read();
-        if (now == _last) return;
-        _last = now;
-        owner.OnNetworkedPreparationChanged();
+        if (!_incomplete || Time.unscaledTime < _next) return;
+        _next = Time.unscaledTime + 1f;
+        Redraw();
     }
 }

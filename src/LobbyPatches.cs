@@ -1,3 +1,5 @@
+using System.Reflection.Emit;
+using System.Linq;
 using System.Collections.Generic;
 using Fusion;
 using HarmonyLib;
@@ -46,35 +48,24 @@ internal static class LobbyPatches
         if (label != null) label.text = (size >= Plugin.VanillaMax ? size : Plugin.Max).ToString();
     }
 
-    // Public room browser: vanilla hides rooms with MaxPlayers > 4. Same logic, our cap.
-    [HarmonyPrefix, HarmonyPatch(nameof(UIMultiplayerConnectDialog.InitPublicLobbyList))]
-    private static bool InitPublicLobbyList_Prefix(UIMultiplayerConnectDialog __instance, List<SessionInfo> pSessionList)
+    // Public room browser: vanilla hides rooms with MaxPlayers > 4. Swap just that constant, so the
+    // rest of the vanilla method stays in charge.
+    [HarmonyTranspiler, HarmonyPatch(nameof(UIMultiplayerConnectDialog.InitPublicLobbyList))]
+    private static IEnumerable<CodeInstruction> InitPublicLobbyList_Transpiler(IEnumerable<CodeInstruction> code)
     {
-        var gi = GameHandler.INSTANCE;
-        var layout = __instance.layoutPublicLobbies;
-        for (int n = layout.childCount - 1; n >= 0; n--)
-            Object.DestroyImmediate(layout.GetChild(n).gameObject);
-
-        __instance.txtPublicRoomErrorMessage.text = pSessionList.Count == 0
-            ? LocalizationInterpreter.GetTranslation("multiplayer_no_public_rooms") : "";
-        __instance._sessionList = pSessionList;
-
-        bool moddedOrFlat = gi.modLoader.AreModsEnabledOrLoaded() | gi.debugSettings.IsFlatscreenMode();
-        foreach (SessionInfo session in pSessionList)
+        var getMaxPlayers = AccessTools.PropertyGetter(typeof(SessionInfo), nameof(SessionInfo.MaxPlayers));
+        var list = code.ToList();
+        int n = 0;
+        for (int i = 0; i + 1 < list.Count; i++)
         {
-            session.Properties.TryGetValue("allowMods", out var allowMods);
-            bool modsOk = !moddedOrFlat || (allowMods != null && (bool)allowMods);
-            if (!modsOk || session.MaxPlayers > Plugin.HardMax || session.Name.Length > 8) continue;
-
-            session.Properties.TryGetValue("isPublicLobby", out var isPublic);
-            if (isPublic != null && (bool)isPublic && session.IsOpen)
+            if (list[i].Calls(getMaxPlayers) && list[i + 1].LoadsConstant(Plugin.VanillaMax))
             {
-                Object.Instantiate(__instance.prefabPublicLobbyButton, layout)
-                    .GetComponent<UIMultiplayerConnectDialog_ButtonJoinPublicRoom>()
-                    .InitButton(session, __instance);
+                list[i + 1] = new CodeInstruction(OpCodes.Ldc_I4, Plugin.HardMax).MoveLabelsFrom(list[i + 1]);
+                n++;
             }
         }
-        return false;
+        if (n != 1) Plugin.Log.LogWarning($"Public room list: expected 1 MaxPlayers<=4 check, found {n} (game updated?)");
+        return list;
     }
 }
 

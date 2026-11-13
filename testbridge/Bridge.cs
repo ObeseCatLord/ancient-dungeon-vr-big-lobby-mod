@@ -248,7 +248,7 @@ public class Bridge : BaseUnityPlugin
                 Out("PREP overflow tables=" + ((System.Collections.IDictionary)ofField.GetValue(null)).Count);
                 try { HarmonyLib.AccessTools.Method(t, "RpcUpdateRunInformationAll_Postfix").Invoke(null, new object[] { p, "bowsword", Fusion.PlayerRef.FromEncoded(104) }); }
                 catch (Exception e) { Out("PREP (expected vanilla UI error from fake list entries) " + e.InnerException?.GetType().Name); }
-                Out($"PREP {p.GetType().Name} list={p.NetworkedPreparationList.Count} panel={HarmonyLib.AccessTools.Method(t, "PanelId").Invoke(null, new object[] { p })}");
+                Out($"PREP {p.GetType().Name} list={p.NetworkedPreparationList.Count} panel={p.Object.Id.Raw}");
                 break;
             }
             case "props":
