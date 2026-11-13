@@ -23,8 +23,9 @@ A BepInEx 5 plugin that raises the multiplayer lobby cap from 4 to 8.
 - Start floor: players 5–8 share the 4 entrance spawn spots, offset 0.6 m to the side so nobody spawns
   inside another player. Vanilla throws here and aborts dungeon generation for those players.
 - Inventory/stat screen: per-player pickup panels and name/mute/teleport rows are added for players
-  5–8. Vanilla throws while wiring up the inventory, which breaks weapons and relics. The other-player
-  stats panel no longer throws, which used to freeze the inventory half-open.
+  5–8. Vanilla throws while wiring up the inventory, which breaks weapons and relics.
+- Other players' stats on the stat screen: the grid of 3 panels grows to up to 7 (one per other player)
+  and shrinks to fit its area. Vanilla threw here, which froze the inventory half-open.
 - Scrying-glass drops (weapon parts, augment crystals) with more than 4 owners now spawn. Vanilla left an
   empty pedestal. The glass's speech bubble still only shows for 4 of the owners (4 networked slots).
 - Special enemies that agree on a position across players (King Slime, phase-jumping and teleporting
@@ -59,7 +60,7 @@ growing past 4. The parts that stopped at 4, or broke, are extended along the ga
 | Arena: extra enemies per wave | 0.25 × players × wave size | continues: 2× wave size at 8 |
 | Arena: extra concurrent enemies | 0, 1, 1, 2 | +1 per 2 more players (4 at 8) |
 | Arena: spawn interval | ×1, ×0.725, ×0.6, ×0.5 | ×2/players (×0.25 at 8) |
-| Arena: relic loot | 2/1, 3/2, 4/2, 4/2 (count/picks) | stays 4/2 (one pedestal per item) |
+| Arena: relic loot (items / group picks) | 2/1, 3/2, 4/2, 4/2 | 5/3 for 5–6, 6/4 for 7–8 (about one pick per 2 players, as vanilla) |
 | Arcane rift: max alive enemies | players + 1 | players + 1, up to 9 (vanilla dropped to 2) |
 | Loot table mix | blends toward the multiplayer weights, fully at 4 | unchanged (stays at the 4-player mix) |
 | Dungeon size | solo vs co-op layout only, not by count | unchanged (see below) |
@@ -81,19 +82,17 @@ list.
 
 | Fix | Must run on | Players without the mod |
 |---|---|---|
-| Room size, ready gate, boss/arena/rift scaling, scrying glass, pedestal options 5–8, food layout, kick rows | host | get the result (it's all host-spawned or host-decided) |
+| Room size, ready gate, boss/arena/rift scaling, arena loot, scrying glass, pedestal options 5–8, food layout, kick rows | host | get the result (it's all host-spawned or host-decided) |
 | Weapon badges for players 5–8 | host + viewer | see the vanilla 4 badges |
 | Pedestal "take one" lockout for options 5–8 | host + each player | only options 1–4 grey out for them, so they could take an extra |
-| Inventory, stat screen, start-floor spawn, public list, player list rows, insight locks, minimap | each player | vanilla behaviour; with 5+ players their inventory and first-floor spawn can break |
+| Inventory, stat screen (incl. other players' stats), start-floor spawn, public list, player list rows, insight locks, minimap | each player | vanilla behaviour; with 5+ players their inventory and first-floor spawn can break |
 
 ## Known limitations
 
 - **Host migration** isn't supported for 5+ player sessions. If the host leaves mid-session, the new
   host only tracks 4 players for the ready gate.
-- **Other players' stat panels** in the inventory only show as many players as the scene has panels.
 - **"Bought by all players" insight upgrades** (e.g. the boss stash) only take effect once every player
   has bought them, as in vanilla. That's rarer with 8 players.
-- **Arena relic waves** stay at 4 items / 2 picks, the 4-player amount.
 - **Small VR targets:** with 8 players, the lobby list rows and insight locks are scaled down to fit their
   panels.
 - **Game updates:** each patch is applied separately and checks that the game code still looks as
@@ -103,6 +102,8 @@ list.
   - every patch applies;
   - an 8-slot private room was created on Photon;
   - (1.2) every patch still applies, each at its expected number of sites;
+  - (1.3) the stat screen grows to 7 other-player panels; the arena loot patch applies (an arena wave
+    with 5+ players hasn't been played yet);
   - the lobby picker, the 8-row player list, 8 insight locks and 8 weapon badges work;
   - the pedestal/food ring layout and scaling formulas give the expected values.
 

@@ -14,7 +14,7 @@ public class Plugin : BaseUnityPlugin
 {
     public const string Guid = "advr.moreplayers";
     public const string Name = "Big Lobby";
-    public const string Version = "1.2.0";
+    public const string Version = "1.3.0";
 
     /// The game's original hard cap. Fusion networked collections and scene UI are built for this many.
     public const int VanillaMax = 4;
