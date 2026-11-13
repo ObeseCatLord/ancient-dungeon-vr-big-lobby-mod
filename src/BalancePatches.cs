@@ -32,7 +32,22 @@ internal static class Safe
     /// Per-player spots (spawn points, teleport targets): reuse them round-robin.
     public static T WrapAt<T>(T[] a, int i) => a.Length == 0 ? a[i] : a[((i % a.Length) + a.Length) % a.Length];
 
-    public static T ListWrapAt<T>(List<T> l, int i) => l.Count == 0 ? l[i] : l[((i % l.Count) + l.Count) % l.Count];
+    /// Start-floor entrance spawn spots: players past the 4 spots share them, offset sideways so that
+    /// two VR players don't spawn inside each other. In-range reads return the vanilla spot unchanged.
+    public static RoomCreator.RoomFile.ExtraObjectsInRoom SpawnMarkerAt(List<RoomCreator.RoomFile.ExtraObjectsInRoom> l, int i)
+    {
+        if ((uint)i < (uint)l.Count || l.Count == 0) return l[i];
+        var src = l[((i % l.Count) + l.Count) % l.Count];
+        int lap = i / l.Count; // 1 for players 5-8
+        float angle = 2f * UnityEngine.Mathf.PI * (i % l.Count) / l.Count;
+        return new RoomCreator.RoomFile.ExtraObjectsInRoom
+        {
+            identifier = src.identifier,
+            pos = src.pos + new UnityEngine.Vector3(UnityEngine.Mathf.Cos(angle), 0f, UnityEngine.Mathf.Sin(angle)) * (0.6f * lap),
+            rot = src.rot,
+            customData = src.customData,
+        };
+    }
 
     internal static int Players => GameHandler.INSTANCE.GetAllPlayers().Count;
 
@@ -75,52 +90,65 @@ internal static class Il
     }
 
     /// Replace `ldelem*` reads from arrays of `elementType[]` with a call to `helper(T[] a, int i)`.
-    /// The array is identified by the nearest preceding field/local load of that array type.
+    /// The array is identified by the nearest preceding field/local load of an array type, within the
+    /// same straight-line block (the scan stops at branches and branch targets), and the ldelem opcode
+    /// must match the element type. If the number of matches isn't `expected`, nothing is patched:
+    /// the game changed, and a guess could corrupt the method.
     public static IEnumerable<CodeInstruction> ReplaceArrayReads(IEnumerable<CodeInstruction> code, MethodBase original,
-        Type elementType, MethodInfo helper)
+        Type elementType, MethodInfo helper, int expected)
     {
         var list = code.ToList();
         var arrayType = elementType.MakeArrayType();
         var locals = original.GetMethodBody()?.LocalVariables;
-        int n = 0;
+        var hits = new List<int>();
         for (int i = 0; i < list.Count; i++)
         {
-            if (!IsLdelem(list[i].opcode)) continue;
-            for (int back = i - 1; back >= Math.Max(0, i - 12); back--)
+            if (!LdelemMatches(list[i], elementType)) continue;
+            for (int back = i - 1; back >= Math.Max(0, i - 16); back--)
             {
+                if (list[back].Branches(out _) || list[back + 1].labels.Count > 0) break;
                 Type t = LoadedType(list[back], locals);
-                if (t == null) continue;
-                if (t == arrayType)
-                {
-                    list[i] = new CodeInstruction(OpCodes.Call, helper).MoveLabelsFrom(list[i]);
-                    n++;
-                }
-                if (t.IsArray) break; // nearest array load decides
+                if (t == null || !t.IsArray) continue;
+                if (t == arrayType) hits.Add(i);
+                break; // nearest array load decides
             }
         }
-        Report(original, $"{elementType.Name}[] reads", n);
+        if (hits.Count != expected)
+        {
+            Plugin.Log.LogWarning($"{Name(original)}: expected {expected} {elementType.Name}[] reads, found {hits.Count}; not patched (game updated?)");
+            return list;
+        }
+        foreach (int i in hits) list[i] = new CodeInstruction(OpCodes.Call, helper).MoveLabelsFrom(list[i]);
+        Plugin.Log.LogDebug($"{Name(original)}: patched {hits.Count} {elementType.Name}[] reads");
         return list;
     }
 
-    /// Replace `List<elementType>.get_Item` calls with `helper(List<T> l, int i)`.
+    /// Replace `List<elementType>.get_Item` calls with `helper(List<T> l, int i)`; same `expected` rule.
     public static IEnumerable<CodeInstruction> ReplaceListReads(IEnumerable<CodeInstruction> code, MethodBase original,
-        Type elementType, MethodInfo helper)
+        Type elementType, MethodInfo helper, int expected)
     {
         var getter = AccessTools.PropertyGetter(typeof(List<>).MakeGenericType(elementType), "Item");
         var list = code.ToList();
-        int n = 0;
-        for (int i = 0; i < list.Count; i++)
+        var hits = Enumerable.Range(0, list.Count).Where(i => list[i].Calls(getter)).ToList();
+        if (hits.Count != expected)
         {
-            if (!list[i].Calls(getter)) continue;
-            list[i] = new CodeInstruction(OpCodes.Call, helper).MoveLabelsFrom(list[i]);
-            n++;
+            Plugin.Log.LogWarning($"{Name(original)}: expected {expected} List<{elementType.Name}> reads, found {hits.Count}; not patched (game updated?)");
+            return list;
         }
-        Report(original, $"List<{elementType.Name}> reads", n);
+        foreach (int i in hits) list[i] = new CodeInstruction(OpCodes.Call, helper).MoveLabelsFrom(list[i]);
+        Plugin.Log.LogDebug($"{Name(original)}: patched {hits.Count} List<{elementType.Name}> reads");
         return list;
     }
 
-    private static bool IsLdelem(OpCode op) =>
-        op == OpCodes.Ldelem_Ref || op == OpCodes.Ldelem_I2 || op == OpCodes.Ldelem_I4 || op == OpCodes.Ldelem;
+    private static bool LdelemMatches(CodeInstruction ci, Type elementType)
+    {
+        if (elementType == typeof(short)) return ci.opcode == OpCodes.Ldelem_I2;
+        if (elementType == typeof(int)) return ci.opcode == OpCodes.Ldelem_I4;
+        if (!elementType.IsValueType) return ci.opcode == OpCodes.Ldelem_Ref;
+        return ci.opcode == OpCodes.Ldelem && ci.operand as Type == elementType;
+    }
+
+    internal static string Name(MethodBase m) => $"{m.DeclaringType?.FullName}.{m.Name}";
 
     private static Type LoadedType(CodeInstruction ci, IList<LocalVariableInfo> locals)
     {
@@ -134,12 +162,13 @@ internal static class Il
 
     private static void Report(MethodBase m, string what, int n)
     {
-        string name = $"{m.DeclaringType?.FullName}.{m.Name}";
-        if (n == 0) Plugin.Log.LogWarning($"{name}: no {what} found to patch (game updated?)");
-        else Plugin.Log.LogDebug($"{name}: patched {n} {what}");
+        if (n == 0) Plugin.Log.LogWarning($"{Name(m)}: no {what} found to patch (game updated?)");
+        else Plugin.Log.LogDebug($"{Name(m)}: patched {n} {what}");
     }
 
-    public static MethodBase MoveNext(Type t, string iterator) => AccessTools.EnumeratorMoveNext(AccessTools.Method(t, iterator));
+    public static MethodBase MoveNext(Type t, string iterator) =>
+        AccessTools.EnumeratorMoveNext(AccessTools.Method(t, iterator))
+        ?? throw new MissingMethodException($"{t.Name}.{iterator} coroutine not found (game updated?)");
 }
 
 // Boss HP per player count: BossInfo.healthForAmountPlayers[count-1] throws at 5+, leaving bosses at
@@ -148,7 +177,7 @@ internal static class Il
 internal static class BossInfoHealthPatch
 {
     private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> code, MethodBase original) =>
-        Il.ReplaceArrayReads(code, original, typeof(short), AccessTools.Method(typeof(Safe), nameof(Safe.ShortTableAt)));
+        Il.ReplaceArrayReads(code, original, typeof(short), AccessTools.Method(typeof(Safe), nameof(Safe.ShortTableAt)), expected: 1);
 }
 
 // Crystal boss spike/enemy tables indexed by count-1: throws at 5+ after disabling everyone's menu.
@@ -158,7 +187,7 @@ internal static class CrystalBossTablesPatch
     private static MethodBase TargetMethod() => Il.MoveNext(typeof(BossCrystalPrisom), nameof(BossCrystalPrisom.BossRoutine));
 
     private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> code, MethodBase original) =>
-        Il.ReplaceArrayReads(code, original, typeof(int), AccessTools.Method(typeof(Safe), nameof(Safe.IntTableAt)));
+        Il.ReplaceArrayReads(code, original, typeof(int), AccessTools.Method(typeof(Safe), nameof(Safe.IntTableAt)), expected: 2);
 }
 
 // Final boss: only 4 "outside room" teleport targets exist; players 5+ index past them and the
@@ -174,10 +203,11 @@ internal static class BeastTeleportTargetsPatch
 
     private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> code, MethodBase original) =>
         Il.ReplaceArrayReads(code, original, typeof(BossBeastTeleportToOutsideRoom),
-            AccessTools.Method(typeof(Safe), nameof(Safe.WrapAt)).MakeGenericMethod(typeof(BossBeastTeleportToOutsideRoom)));
+            AccessTools.Method(typeof(Safe), nameof(Safe.WrapAt)).MakeGenericMethod(typeof(BossBeastTeleportToOutsideRoom)), expected: 1);
 }
 
 // Start floor has 4 entrance spawn spots; local player index 4+ threw and aborted world generation.
+// Players 5-8 now share the spots, offset sideways.
 [HarmonyPatch]
 internal static class StartRoomSpawnPatch
 {
@@ -185,7 +215,7 @@ internal static class StartRoomSpawnPatch
 
     private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> code, MethodBase original) =>
         Il.ReplaceListReads(code, original, typeof(RoomCreator.RoomFile.ExtraObjectsInRoom),
-            AccessTools.Method(typeof(Safe), nameof(Safe.ListWrapAt)).MakeGenericMethod(typeof(RoomCreator.RoomFile.ExtraObjectsInRoom)));
+            AccessTools.Method(typeof(Safe), nameof(Safe.SpawnMarkerAt)), expected: 1);
 }
 
 // Arena and arcane-rift balance switches only have cases for 1-4 and fall back to solo values otherwise.
@@ -274,31 +304,29 @@ internal static class ArenaWaveSizePatch
     }
 }
 
-// Arcane rift: the coroutine keeps lMaxEnemiesAlive in a state-machine field. Adjust it right after it's set.
+// Arcane rift: the coroutine keeps lMaxEnemiesAlive in a state-machine field. It's stored several times
+// (a dummy initial value, then one store per switch arm), so instead of patching a store, pass every
+// read of the field through Safe.RiftMaxAlive.
 [HarmonyPatch]
 internal static class RiftMaxAlivePatch
 {
     private static MethodBase TargetMethod() => Il.MoveNext(typeof(AIPOIArcaneRift), nameof(AIPOIArcaneRift.SemiBossRoutine));
 
-    private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> code)
+    private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> code, MethodBase original)
     {
-        var list = code.ToList();
-        int i = list.FindIndex(ci => ci.opcode == OpCodes.Stfld && ci.operand is FieldInfo fi && fi.Name.Contains("lMaxEnemiesAlive"));
-        if (i < 0)
+        var helper = AccessTools.Method(typeof(Safe), nameof(Safe.RiftMaxAlive));
+        int n = 0;
+        foreach (var ci in code)
         {
-            Plugin.Log.LogWarning("SemiBossRoutine: lMaxEnemiesAlive not found (game updated?); rift stays at 4-player limit");
-            return list;
+            yield return ci;
+            if (ci.opcode == OpCodes.Ldfld && ci.operand is FieldInfo fi && fi.Name.Contains("lMaxEnemiesAlive"))
+            {
+                yield return new CodeInstruction(OpCodes.Call, helper);
+                n++;
+            }
         }
-        var field = (FieldInfo)list[i].operand;
-        list.InsertRange(i + 1, new[]
-        {
-            new CodeInstruction(OpCodes.Ldarg_0),
-            new CodeInstruction(OpCodes.Ldarg_0),
-            new CodeInstruction(OpCodes.Ldfld, field),
-            new CodeInstruction(OpCodes.Call, AccessTools.Method(typeof(Safe), nameof(Safe.RiftMaxAlive))),
-            new CodeInstruction(OpCodes.Stfld, field),
-        });
-        return list;
+        if (n == 0) Plugin.Log.LogWarning($"{Il.Name(original)}: lMaxEnemiesAlive reads not found (game updated?); rift stays at 4-player limit");
+        else Plugin.Log.LogDebug($"{Il.Name(original)}: wrapped {n} lMaxEnemiesAlive reads");
     }
 }
 
@@ -331,5 +359,36 @@ internal static class BossHealthOverflowPatch
             else yield return ci;
         }
         if (n == 0) Plugin.Log.LogWarning($"{original.DeclaringType?.Name}.{original.Name}: no short casts found (game updated?)");
+    }
+}
+
+// Special enemies (King Slime, phase-jumping / teleporting AI) agree on a position by weighting each
+// alive player's reported position, but vanilla only looks at the first 4 alive players. Same
+// weighting, all alive players. Runs locally on each client.
+[HarmonyPatch(typeof(ADVRNetworkTransformSpecial), nameof(ADVRNetworkTransformSpecial.GetPositionWish))]
+internal static class PositionWishPatch
+{
+    private static bool Prefix(ADVRNetworkTransformSpecial __instance, ref UnityEngine.Vector3 __result)
+    {
+        var players = GameHandler.INSTANCE.GetAllAlivePlayers();
+        if (players.Count <= Plugin.VanillaMax) return true; // identical to vanilla
+        var id = __instance.networkObject.Id;
+        var self = __instance.transform.position;
+        UnityEngine.Vector3 sum = UnityEngine.Vector3.zero;
+        float weights = 0f;
+        foreach (var p in players)
+        {
+            if (!p.playerController.networkedSpecialEnemyInfos.TryGet(id, out var info))
+            {
+                __result = UnityEngine.Vector3.zero;
+                return false;
+            }
+            if (info.position == UnityEngine.Vector3.zero) continue;
+            float w = UnityEngine.Mathf.Min(1f, 1f / UnityEngine.Vector3.Distance(self, p.playerController.transform.position));
+            sum += info.position * w;
+            weights += w;
+        }
+        __result = sum / weights;
+        return false;
     }
 }
