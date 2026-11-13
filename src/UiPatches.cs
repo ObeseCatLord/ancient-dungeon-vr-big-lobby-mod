@@ -319,15 +319,17 @@ internal static class InventoryPanelsPatch
     }
 }
 
-// Stat screen shows other players' stats in a fixed set of panels. With more other players than panels
-// vanilla throws on every refresh, which also stops the inventory from animating open (player stuck).
-// Same loop, bounded; players past the last panel aren't shown.
+// Stat screen shows other players' stats in a grid of 3 panels. Add panels for up to 7 other players
+// and shrink the grid to fit its area. With more other players than panels vanilla throws on every
+// refresh, which also stops the inventory from animating open (player stuck), so the loop is bounded
+// too, in case extending isn't possible.
 [HarmonyPatch(typeof(Inventory), nameof(Inventory.UpdateNetworkedPlayerStats))]
 internal static class NetworkedStatsPatch
 {
     private static bool Prefix(Inventory __instance)
     {
         var infos = __instance._networkedPlayerInfos;
+        ExtendPanels(__instance, infos.Count);
         var panels = __instance.networkedPlayerStats;
         int shown = Math.Min(infos.Count, panels.Length);
         for (int i = 0; i < shown; i++)
@@ -340,6 +342,24 @@ internal static class NetworkedStatsPatch
         for (int j = 0; j < panels.Length; j++)
             panels[j].gameObject.SetActive(infos.Count >= j + 1);
         return false;
+    }
+
+    private static void ExtendPanels(Inventory inv, int others)
+    {
+        var panels = inv.networkedPlayerStats;
+        int needed = Math.Min(others, Plugin.HardMax - 1);
+        if (panels == null || panels.Length == 0 || panels.Length >= needed || UiExtend.GaveUp(inv)) return;
+        try
+        {
+            if (panels[0].transform.parent is RectTransform grid)
+                FitWhenVisible.Request(grid, vertical: true); // records the grid's original size first
+            inv.networkedPlayerStats = UiExtend.ExtendByCloning(panels, needed);
+        }
+        catch (Exception e)
+        {
+            Plugin.Log.LogError($"Extending other-player stat panels failed: {e}");
+            UiExtend.GiveUp(inv, "Other-player stat panels");
+        }
     }
 }
 

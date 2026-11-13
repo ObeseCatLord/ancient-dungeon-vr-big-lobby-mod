@@ -259,6 +259,16 @@ public class Bridge : BaseUnityPlugin
                 foreach (var kv in props) Out($"PROP {kv.Key} = {kv.Value?.PropertyValue}");
                 break;
             }
+            case "statpanels": // statpanels <others>: run the mod's other-player stat panel extension
+            {
+                var inv = GameHandler.INSTANCE.inventory;
+                var t = HarmonyLib.AccessTools.TypeByName("ADVRMorePlayers.NetworkedStatsPatch");
+                HarmonyLib.AccessTools.Method(t, "ExtendPanels").Invoke(null, new object[] { inv, int.Parse(arg) });
+                var grid = inv.networkedPlayerStats[0].transform.parent;
+                Out($"STATPANELS n={inv.networkedPlayerStats.Length} grid={PathOf(grid)} children={grid.childCount} fit={grid.GetComponent(HarmonyLib.AccessTools.TypeByName("ADVRMorePlayers.FitWhenVisible")) != null}");
+                foreach (var p in inv.networkedPlayerStats) Out($"  {PathOf(p.transform)} sibling={p.transform.GetSiblingIndex()}");
+                break;
+            }
             case "formulas":
             {
                 var safe = HarmonyLib.AccessTools.TypeByName("ADVRMorePlayers.Safe");

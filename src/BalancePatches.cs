@@ -392,3 +392,36 @@ internal static class PositionWishPatch
         return false;
     }
 }
+
+// Arena relic waves: vanilla gives (items, group picks) = (2,1), (3,2), (4,2), (4,2) for 1-4 players,
+// about one pick per two players. Continue that for 5-8: picks = ceil(players/2), items = picks + 2,
+// capped by the arena's small pedestals (each client indexes them by item, so never exceed them).
+// Host-only: the relic wave calls InitializeSpawns on the state authority with the 4-player amounts.
+[HarmonyPatch(typeof(PodestGroupArenaMode), nameof(PodestGroupArenaMode.InitializeSpawns))]
+internal static class ArenaLootPatch
+{
+    private static void Prefix(PodestGroupArenaMode __instance,
+        List<ArenaWaves.LootWaveWeights.LootWaveEntry> lootWaveEntries, ref int amountToPickUp, bool isReroll)
+    {
+        try
+        {
+            int players = Safe.Players;
+            if (isReroll || players <= Plugin.VanillaMax || !__instance.HasStateAuthority) return;
+            if (lootWaveEntries == null || lootWaveEntries.Count == 0) return;
+            if (lootWaveEntries.Exists(e => e.lootObject == "item_upgrade_curses")) return; // curse waves stay vanilla
+
+            var arena = ArenaManager.INSTANCE;
+            var weights = arena?.runtimeValues?.lootWaveWeights;
+            if (weights == null) return;
+            int picks = (players + 1) / 2;
+            int items = Math.Min(Math.Min(picks + 2, __instance.tinyPodests.Length), 10);
+            int seed = GameHandler.INSTANCE.currentWorldGenerator.seed;
+            // Same hash recipe vanilla uses for the first entries (kills + index + seed).
+            for (int i = lootWaveEntries.Count; i < items; i++)
+                lootWaveEntries.Add(weights.GetRandomWeightedLoot(arena.networkedCurrentKills + i + seed));
+            amountToPickUp = Math.Max(amountToPickUp, Math.Min(picks, lootWaveEntries.Count - 1));
+            Plugin.Log.LogDebug($"Arena relic wave for {players} players: {lootWaveEntries.Count} items, {amountToPickUp} picks");
+        }
+        catch (Exception e) { Plugin.Log.LogError($"Arena loot scaling failed: {e}"); }
+    }
+}
